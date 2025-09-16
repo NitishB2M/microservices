@@ -10,7 +10,7 @@ import (
 
 type Payment struct {
 	PaymentID            int       `gorm:"primaryKey;autoIncrement" json:"payment_id"`
-	OrderID              int       `gorm:"not null" json:"order_id"`
+	OrderID              string    `gorm:"not null" json:"order_id"`
 	PaymentMethod        string    `gorm:"not null" json:"payment_method"`
 	PaymentStatus        string    `gorm:"not null" json:"payment_status"` // "Pending", "Completed", "Failed"
 	PaymentFailureReason string    `gorm:"type:text;default:null" json:"payment_failure_reason"`

@@ -9,16 +9,20 @@ import (
 	"e-commerce-backend/shared/utils"
 	"encoding/json"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
+	"sync"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
+
+var orderMutex sync.Mutex
 
 type Service struct {
 	DB *gorm.DB
@@ -42,29 +46,119 @@ func (db *Service) GetOrders(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok"})
 }
 
-func (db *Service) CreateOrder(c *gin.Context) {
-	if err := constants.ValidateUserWithCtxUserId(c); err != nil {
-		utils.GinError(c, err.Error(), http.StatusBadRequest, err)
+func (db *Service) GetUserOrders(c *gin.Context) {
+	userId, err := utils.GetUserFromGinCtx(c)
+	if err != nil {
+		utils.GinError(c, utils.UserIdNotFoundInCtx, http.StatusBadRequest, err)
 		return
 	}
 
-	c.JSON(200, gin.H{"status": "ok"})
+	var order models.Order
+	orders, err := order.GetOrdersByUserId(db.DB, userId)
+	if err != nil {
+		utils.GinError(c, err.Error(), http.StatusInternalServerError, err)
+		return
+	}
+
+	utils.GinResponse(orders, c, utils.OrdersFetchedSuccessfully, http.StatusOK)
+}
+
+func (db *Service) CreateOrder(c *gin.Context) {
+	orderMutex.Lock()
+	defer orderMutex.Unlock()
+	userId, err := utils.GetUserFromGinCtx(c)
+	if err != nil {
+		utils.GinError(c, utils.UserIdNotFoundInCtx, http.StatusBadRequest, err)
+		return
+	}
+
+	var body payloads.OrderRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		utils.GinError(c, utils.InvalidJSONBody, http.StatusBadRequest, err)
+		return
+	}
+
+	var order models.Order
+	order.OrderID = uuid.New()
+	order.UserID = userId
+	order.OrderStatus = "pending"
+	order.PromoCode = body.PromoCode
+	order.DiscountAmount = body.DiscountAmount
+	order.TaxAmount = body.TaxAmount
+	order.TotalAmount = body.TotalAmount
+	billingAddressId, _ := uuid.Parse(body.BillingAddressId)
+	shippingAddressId, _ := uuid.Parse(body.ShippingAddressId)
+	order.OrderShipping = models.OrderShipping{
+		BillingUserId:     userId,
+		BillingAddressId:  billingAddressId,
+		BillingContact:    body.BillingContact,
+		ShippingAddressId: shippingAddressId,
+		ShippingContact:   body.ShippingContact,
+		ShippingCost:      body.ShippingCost,
+	}
+
+	subTotalPrice, totalDiscount := 0.0, 0.0
+
+	for _, ct := range body.Carts {
+		cartId := ct.CartID
+
+		cart, err := fetchCartDetails(c, cartId)
+		if err != nil {
+			utils.GinError(c, err.Error(), http.StatusBadRequest, err)
+			return
+		}
+		if cart == nil {
+			utils.GinError(c, fmt.Sprintf(utils.CartItemNotFoundError, cartId), http.StatusBadRequest, err)
+			return
+		}
+		cartData := cart["data"].(map[string]interface{})
+
+		productId := int(cartData["product_id"].(float64))
+		product := fetchProductDetails(c, productId)
+		if product == nil {
+			utils.GinError(c, fmt.Sprintf(utils.ProductNotFoundError, productId), http.StatusBadRequest, err)
+			return
+		}
+		productData := product["data"].(map[string]interface{})
+		if ok := verifyQuantity(int(cartData["quantity"].(float64)), int(productData["quantity"].(float64))); !ok {
+			utils.GinError(c, fmt.Sprintf(utils.CartOutOfStockError, productId), http.StatusBadRequest, nil)
+			return
+		}
+
+		//calculating individual product price
+		eachTotalPrice, eachDiscountAmt := calculatePrice(productData["price"].(float64), productData["discount"].(float64), int(cartData["quantity"].(float64)))
+		subTotalPrice += eachTotalPrice
+		totalDiscount += eachDiscountAmt
+
+		order.OrderItems = append(order.OrderItems, models.OrderItems{
+			CartId:         cartId,
+			ProductID:      productId,
+			Quantity:       int(cartData["quantity"].(float64)),
+			Price:          productData["price"].(float64),
+			Discount:       productData["discount"].(float64),
+			ItemTotalPrice: eachTotalPrice,
+		})
+	}
+
+	//adding default tax(18%)
+	//taxAmt, subTotalPrice := calculateTotalWithTax(subTotalPrice)
+	//order.TaxAmount = taxAmt
+	order.SubTotal = subTotalPrice
+	order.DiscountAmount = totalDiscount
+	order.TotalAmount = subTotalPrice - totalDiscount
+
+	if err := order.CreateOrder(db.DB); err != nil {
+		utils.GinError(c, err.Error(), http.StatusInternalServerError, err)
+		return
+	}
+
+	utils.GinResponse(order, c, utils.OrderCreatedSuccessfully, http.StatusOK)
 }
 
 func (db *Service) GetOrderById(c *gin.Context) {
-	if err := constants.ValidateUserWithCtxUserId(c); err != nil {
-		utils.GinError(c, err.Error(), http.StatusBadRequest, err)
-		return
-	}
-
-	orderIdStr := c.Param("order_id")
-	if orderIdStr == "" {
+	orderId := c.Param("order_id")
+	if orderId == "" {
 		utils.GinError(c, utils.OrderIdRequired, http.StatusBadRequest, nil)
-		return
-	}
-	orderId, err := strconv.Atoi(orderIdStr)
-	if err != nil {
-		utils.GinError(c, fmt.Sprintf(utils.OrderIdInvalid, orderIdStr), http.StatusBadRequest, nil)
 		return
 	}
 
@@ -74,25 +168,47 @@ func (db *Service) GetOrderById(c *gin.Context) {
 		return
 	}
 
-	utils.GinResponse(order, c, fmt.Sprintf(utils.OrderFetchSuccess, orderId), http.StatusOK)
+	var orderResp payloads.OrderResponse
+	copyOrderToResponseOrder(order, &orderResp)
+
+	for i, item := range order.OrderItems {
+		product := fetchProductDetails(c, item.ProductID)
+		if product == nil {
+			utils.GinError(c, fmt.Sprintf(utils.ProductNotFoundError, item.ProductID), http.StatusBadRequest, nil)
+			return
+		}
+		productData := product["data"].(map[string]interface{})
+
+		orderResp.Items[i].ProductName = productData["name"].(string)
+		orderResp.Items[i].ProductDesc = productData["description"].(string)
+		orderResp.Items[i].Price = item.Price
+		orderResp.Items[i].Quantity = item.Quantity
+		orderResp.Items[i].Discount = item.Discount
+		orderResp.Items[i].TotalPrice = item.ItemTotalPrice
+	}
+
+	utils.GinResponse(orderResp, c, fmt.Sprintf(utils.OrderFetchSuccess, orderId), http.StatusOK)
 }
 
 func (db *Service) Checkout(c *gin.Context) {
-	if err := constants.ValidateUserWithCtxUserId(c); err != nil {
-		utils.GinError(c, err.Error(), http.StatusBadRequest, err)
-		return
-	}
-
-	userId, err := constants.GetUserIdFromParams(c)
+	userId, err := utils.GetUserFromGinCtx(c)
 	if err != nil {
-		utils.GinError(c, fmt.Sprintf(utils.UserNotFoundError, userId), http.StatusBadRequest, err)
+		utils.GinError(c, utils.UserIdNotFoundInCtx, http.StatusBadRequest, err)
 		return
 	}
 
 	//how to fetch body
-	var body payloads.RequestCart
+	var body payloads.OrderRequest
 	if err := c.ShouldBindJSON(&body); err != nil {
 		utils.GinError(c, utils.InvalidJSONBody, http.StatusBadRequest, err)
+		return
+	}
+	//avoid race condition
+	orderMutex.Lock()
+	defer orderMutex.Unlock()
+	userData, err := fetchUserDetails(c, userId)
+	if err != nil {
+		utils.LogError("from order services: Failed to fetch user data", map[string]interface{}{"error": err.Error()})
 		return
 	}
 
@@ -104,10 +220,10 @@ func (db *Service) Checkout(c *gin.Context) {
 	subTotalPrice, totalDiscount := 0.0, 0.0
 	var order models.Order
 
-	for _, cart := range carts {
-		cartId := int(cart["cart_id"].(float64))
+	for _, ct := range carts {
+		cartId := ct.CartID
 
-		cart, err := fetchCartDetails(c, userId, cartId)
+		cart, err := fetchCartDetails(c, cartId)
 		if err != nil {
 			utils.GinError(c, err.Error(), http.StatusBadRequest, err)
 			return
@@ -141,27 +257,32 @@ func (db *Service) Checkout(c *gin.Context) {
 		var invoiceItem invoices.InvoiceItem
 		appendCartToInvoiceItem(&invoiceItem, cartData, productData, eachTotalPrice)
 		invoiceList.InvoiceItemList = append(invoiceList.InvoiceItemList, invoiceItem)
+
+		order.OrderItems = append(order.OrderItems, models.OrderItems{
+			CartId:         cartId,
+			ProductID:      productId,
+			Quantity:       int(cartData["quantity"].(float64)),
+			Price:          productData["price"].(float64),
+			Discount:       productData["discount"].(float64),
+			ItemTotalPrice: eachTotalPrice,
+		})
 	}
 
 	//adding default tax(18%)
 	taxAmt, subTotalPrice := calculateTotalWithTax(subTotalPrice)
 
-	cartItemsJSON, err := json.Marshal(cartIds)
-	if err != nil {
-		utils.GinError(c, err.Error(), http.StatusBadRequest, err)
-		return
-	}
-	//temporary basis
-	order.OrderID = 1
-	order.CreatedAt = time.Now()
-	order.UpdatedAt = time.Now()
-
-	order.CustomerID = userId
+	order.OrderID = uuid.New()
+	order.UserID = userId
 	order.TaxAmount = taxAmt
 	order.SubTotal = subTotalPrice
 	order.TotalAmount = subTotalPrice + taxAmt
 	order.DiscountAmount = totalDiscount
-	order.Carts = string(cartItemsJSON)
+	order.OrderShipping = models.OrderShipping{
+		BillingUserId:   userId,
+		BillingContact:  body.BillingContact,
+		ShippingContact: body.ShippingContact,
+		ShippingCost:    body.ShippingCost,
+	}
 	//create order
 	if err := order.CreateOrder(db.DB); err != nil {
 		utils.GinError(c, err.Error(), http.StatusBadRequest, err)
@@ -188,17 +309,11 @@ func (db *Service) Checkout(c *gin.Context) {
 		}
 	}
 
-	userData, err := fetchUserDetails(c, userId)
-	if err != nil {
-		utils.LogError("from order services: Failed to fetch user data", map[string]interface{}{"error": err.Error()})
-		return
-	}
-
 	//send data to invoice generator also this will send mail to user
 	GenerateOrderInvoice(order, userData, invoiceList)
 	go SendInvoice()
 
-	utils.GinResponse(order, c, utils.OrderSuccessful, http.StatusOK)
+	utils.GinResponse(order, c, utils.OrderCreatedSuccessfully, http.StatusOK)
 }
 
 func fetchUserDetails(c *gin.Context, userId int) (map[string]interface{}, error) {
@@ -220,15 +335,18 @@ func fetchUserDetails(c *gin.Context, userId int) (map[string]interface{}, error
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, resp.Body); err != nil {
 		return nil, fmt.Errorf("failed to read response body. error: %w", err)
+	}
+	body := buf.Bytes()
+	if strings.Contains(string(body), "error") {
+		return nil, fmt.Errorf("failed to fetch user details. error: %s", resp.Status)
 	}
 
 	var userDetails map[string]interface{}
-	err = json.Unmarshal(body, &userDetails)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response body. error: %w", err)
+	if err := utils.ParseJSON(body, &userDetails); err != nil {
+		return nil, fmt.Errorf("failed to parse response body. error: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -244,11 +362,11 @@ func fetchUserDetails(c *gin.Context, userId int) (map[string]interface{}, error
 	return userDetails, nil
 }
 
-func fetchCartDetails(c *gin.Context, userId, cartId int) (map[string]interface{}, error) {
+func fetchCartDetails(c *gin.Context, cartId int) (map[string]interface{}, error) {
 	links := constants.MicroserviceLinks()
 	cartLink := links["cartMSCallByIdLink"]
 
-	cartMicroserviceCall := fmt.Sprintf(cartLink, userId, cartId)
+	cartMicroserviceCall := fmt.Sprintf(cartLink, cartId)
 	log.Println(cartMicroserviceCall)
 	req, err := http.NewRequest(http.MethodGet, cartMicroserviceCall, nil)
 	if err != nil {
@@ -268,9 +386,13 @@ func fetchCartDetails(c *gin.Context, userId, cartId int) (map[string]interface{
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf(utils.ErrorCallingCartMicroservice) //change error message
+	var buf bytes.Buffer
+	if _, err = io.Copy(&buf, resp.Body); err != nil {
+		return nil, fmt.Errorf("failed to read response body") //change error message
+	}
+	body := buf.Bytes()
+	if strings.Contains(string(body), "error") {
+		return nil, fmt.Errorf("failed to fetch cart details")
 	}
 
 	var cart map[string]interface{}
@@ -369,10 +491,10 @@ func calculateTotalWithTax(totalAmt float64) (float64, float64) {
 func proceedForPayment(c *gin.Context, order models.Order) (map[string]interface{}, error) {
 	links := constants.MicroserviceLinks()
 	paymentLink := links["paymentMSInitiateCallLink"]
-	paymentMicroserviceCall := fmt.Sprintf(paymentLink, order.OrderID)
+	paymentMicroserviceCall := fmt.Sprintf(paymentLink, order.OrderID.String())
 	log.Println(paymentMicroserviceCall)
 
-	payload := map[string]interface{}{"customer_id": order.CustomerID, "total_amount": order.TotalAmount, "order_id": order.OrderID}
+	payload := map[string]interface{}{"user_id": order.UserID, "total_amount": order.TotalAmount, "order_id": order.OrderID.String()}
 	jsonPayload, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, paymentMicroserviceCall, bytes.NewBuffer(jsonPayload))
 	if err != nil {
@@ -415,4 +537,18 @@ func appendCartToInvoiceItem(invoice *invoices.InvoiceItem, cart, product map[st
 	invoice.Description = product["description"].(string)
 	invoice.Item = product["product_name"].(string)
 	invoice.DiscountedPrice = strconv.FormatFloat(product["discount"].(float64), 'f', -1, 64)
+}
+
+func copyOrderToResponseOrder(order models.Order, responseOrder *payloads.OrderResponse) {
+	responseOrder.OrderID = order.OrderID.String()
+	responseOrder.TotalAmount = order.TotalAmount
+	responseOrder.IsPaid = order.IsPaid
+	responseOrder.OrderStatus = order.OrderStatus
+	responseOrder.PromoCode = order.PromoCode
+	responseOrder.DiscountAmount = order.DiscountAmount
+	responseOrder.TaxAmount = order.TaxAmount
+	responseOrder.SubTotal = order.SubTotal
+	responseOrder.CreatedAt = order.CreatedAt
+	responseOrder.UpdatedAt = order.UpdatedAt
+	responseOrder.Shipping = order.OrderShipping
 }

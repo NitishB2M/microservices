@@ -14,6 +14,7 @@ const (
 	OrderUpdatedSubject              = "Your Order #%s Has Been Updated"
 	OrderAwaitingPaymentSubject      = "Action Required: Your Order is Awaiting Payment"
 	OrderInvoiceAttachedSubject      = "Your Order #%s Invoice File Attached Below"
+	PasswordResetSubject             = "Reset Password Request"
 )
 
 const TEST_EMAIL_TEMPLATE = `
@@ -214,6 +215,20 @@ const ORDER_AWAITING_PAYMENT_TEMPLATE = `
 	If you need any assistance with payment, feel free to contact us at <a href="mailto:support@yourcompany.com">support@yourcompany.com</a>.<br><br>
 	
 	Thank you for your prompt attention.<br><br>
+	Best regards,<br>
+	The Team
+`
+
+const PASSWORD_RESET_TEMPLATE = `
+	Hello {{.CustomerName}},<br><br>
+	We received a request to reset your password for your account.<br><br>
+	
+	To reset your password, please click the link below:<br><br>
+	
+	<a href="{{.ResetPasswordLink}}">Reset Password</a><br><br>
+	
+	If you did not request a password reset, please ignore this email.<br><br>
+	
 	Best regards,<br>
 	The Team
 `
